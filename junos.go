@@ -3,10 +3,14 @@
 package junos
 
 import (
+	"bufio"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -163,6 +167,36 @@ type versionPackageInfo struct {
 	SoftwareVersion []string `xml:"comment"`
 }
 
+func getHostKey(host string) (ssh.PublicKey, error) {
+	file, err := os.Open(filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts"))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	var hostKey ssh.PublicKey
+	for scanner.Scan() {
+		fields := strings.Split(scanner.Text(), " ")
+		if len(fields) != 3 {
+			continue
+		}
+		if strings.Contains(fields[0], host) {
+			var err error
+			hostKey, _, _, _, err = ssh.ParseAuthorizedKey(scanner.Bytes())
+			if err != nil {
+				return nil, errors.New(fmt.Sprintf("error parsing %q: %v", fields[2], err))
+			}
+			break
+		}
+	}
+
+	if hostKey == nil {
+		return nil, errors.New(fmt.Sprintf("no hostkey for %s", host))
+	}
+	return hostKey, nil
+}
+
 // genSSHClientConfig is a wrapper function based around the auth method defined
 // (user/password or private key) which returns the SSH client configuration used to
 // connect.
@@ -177,6 +211,26 @@ func genSSHClientConfig(auth *AuthMethod) (*ssh.ClientConfig, error) {
 
 	if len(auth.PrivateKey) > 0 {
 		config, err := netconf.SSHConfigPubKeyFile(auth.Username, auth.PrivateKey, auth.Passphrase)
+		if err != nil {
+			return config, err
+		}
+
+		config.HostKeyCallback = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			hostKey, err := getHostKey(hostname)
+			if err != nil {
+				return err
+			}
+			if hostKey == key {
+				return nil
+			}
+			return errors.New(fmt.Sprintf("hostkey does not match for %s", hostname))
+		}
+
+		return config, nil
+	}
+
+	if len(auth.Username) > 0 {
+		config, err := netconf.SSHConfigPubKeyAgent(auth.Username)
 		if err != nil {
 			return config, err
 		}
